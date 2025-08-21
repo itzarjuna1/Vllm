@@ -221,6 +221,28 @@ async def test_server_load(server: RemoteOpenAIServer):
     assert response.json().get("server_load") == 0
 
 
+@pytest.fixture(scope="function")
+def bind_server(server_args):
+    args = [
+        # use half precision for speed and memory savings in CI environment
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "2048",
+        "--enforce-eager",
+        "--max-num-seqs",
+        "128",
+        *server_args,
+    ]
+
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+        yield remote_server
+
+
+#TODO: This test takes a lot of time because a separate server is started
+# for each case. Look to speed up or parallelize.
+
+
 @pytest.mark.parametrize(
     ("server_args", "expected_addrs", "unexpected_addrs"),
     [
@@ -237,14 +259,14 @@ async def test_server_load(server: RemoteOpenAIServer):
     indirect=["server_args"],
 )
 @pytest.mark.asyncio
-async def test_bind_ipv4_ipv6(server: RemoteOpenAIServer,
+async def test_bind_ipv4_ipv6(bind_server: RemoteOpenAIServer,
                               expected_addrs: list[str],
                               unexpected_addrs: list[str]):
     # if the test system lacks IPv4 or IPv6, move addresses of those types
     # to unexpected_addrs
     has_ipv4, has_ipv6 = False, False
     for family, _, _, _, _ in socket.getaddrinfo(None,
-                                                 server.port,
+                                                 bind_server.port,
                                                  type=socket.SOCK_STREAM,
                                                  flags=socket.AI_PASSIVE):
         if family == socket.AF_INET:
@@ -258,10 +280,11 @@ async def test_bind_ipv4_ipv6(server: RemoteOpenAIServer,
             unexpected_addrs.append(addr)
 
     for addr in expected_addrs:
-        response = requests.get(server.url_for_host(addr, "health"), timeout=1)
+        response = requests.get(bind_server.url_for_host(addr, "health"),
+                                timeout=1)
         assert response.status_code == HTTPStatus.OK
 
     for addr in unexpected_addrs:
         with pytest.raises(requests.ConnectionError):
-            _response = requests.get(server.url_for_host(addr, "health"),
+            _response = requests.get(bind_server.url_for_host(addr, "health"),
                                      timeout=1)
