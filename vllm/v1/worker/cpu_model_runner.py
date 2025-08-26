@@ -111,14 +111,14 @@ class CPUModelRunner(GPUModelRunner):
 
 @contextmanager
 def _set_global_compilation_settings(config: VllmConfig):
-    import torch._inductor.config
+    import torch._inductor.config as torch_inductor_config
 
     inductor_config = config.compilation_config.inductor_compile_config
     try:
         # Note: The MKLDNN and CPPGEMM backend requires freezing parameters.
-        freezing_value = torch._inductor.config.freezing
+        freezing_value = torch_inductor_config.freezing
         if inductor_config.get("max_autotune", False):
-            torch._inductor.config.freezing = True
+            torch_inductor_config.freezing = True
         yield
     finally:
-        torch._inductor.config.freezing = freezing_value
+        torch_inductor_config.freezing = freezing_value
