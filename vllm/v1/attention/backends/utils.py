@@ -5,7 +5,8 @@ import enum
 import functools
 from abc import abstractmethod
 from dataclasses import dataclass, make_dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
+from typing import (TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar,
+                    Union)
 
 import numpy as np
 import torch
@@ -64,6 +65,9 @@ class CommonAttentionMetadata:
     slot_mapping: torch.Tensor
 
     causal: bool = True
+
+    cp_local_token_select_indices_cpu: torch.Tensor = None
+    cp_num_computed_tokens_cpu_tensor: torch.Tensor = None
 
 
 @dataclass
@@ -601,7 +605,7 @@ def reorder_batch_to_split_decodes_and_prefills(
     input_batch: "InputBatch",
     scheduler_output: "SchedulerOutput",
     decode_threshold: int = 1,
-) -> bool:
+) -> Union[bool, tuple[bool, int]]:
     """
     Reorders the batch to split into prefill and decode requests; places all
     requests with <= decode_threshold tokens at the front of the batch.
@@ -657,7 +661,7 @@ def reorder_batch_to_split_decodes_and_prefills(
         input_batch.swap_states(prefills[i - 1], decode_idx)
         modified_batch = True
 
-    return modified_batch
+    return modified_batch, num_decodes
 
 
 KV_SHARING_FAST_PREFILL_METADATA_FIELDS = [
