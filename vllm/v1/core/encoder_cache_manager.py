@@ -60,7 +60,7 @@ class EncoderCacheManager:
             last call to get_freed_mm_hashes(). This list is cleared on return.
     """
 
-    def __init__(self, cache_size: int, is_encoder_decoder: bool):
+    def __init__(self, cache_size: int, is_encoder_decoder: bool = False):
         self.cache_size = cache_size
         self.num_free_slots = cache_size
         self.num_freeable_slots = cache_size
