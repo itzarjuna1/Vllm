@@ -59,8 +59,9 @@ def main() -> int:
         if not Path(filepath).exists():
             continue
 
-        if filepath == "setup.py":
+        if filepath == "setup.py" or filepath == "kernels/setup.py":
             continue
+        print(f"Checking {filepath}...")
 
         violations = check_file(filepath)
         if violations:
