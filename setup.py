@@ -38,6 +38,8 @@ envs = load_module_from_path('envs', os.path.join(ROOT_DIR, 'vllm', 'envs.py'))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 
+print("This is a !test of the emergency broadcast systems (actually just for CI testing, dude)")
+
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning(
         "VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
