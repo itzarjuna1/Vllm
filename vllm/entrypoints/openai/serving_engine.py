@@ -165,7 +165,6 @@ class ServeContext(RequestProcessingMixin, ResponseGenerationMixin, BaseModel,
 
     # Shared across most requests
     tokenizer: Optional[AnyTokenizer] = None
-    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
 
     # `protected_namespaces` resolves Pydantic v2's warning
     # on conflict with protected namespace "model_"
@@ -297,14 +296,12 @@ class OpenAIServing:
         truncate_prompt_tokens = getattr(ctx.request, "truncate_prompt_tokens",
                                          None)
 
-        if truncate_prompt_tokens is not None:
-            if truncate_prompt_tokens <= self.max_model_len:
-                ctx.truncate_prompt_tokens = truncate_prompt_tokens
-            else:
-                return self.create_error_response(
-                    "truncate_prompt_tokens value is "
-                    "greater than max_model_len."
-                    " Please, select a smaller truncation size.")
+        if truncate_prompt_tokens is not None and \
+            truncate_prompt_tokens > self.max_model_len:
+            return self.create_error_response(
+                "truncate_prompt_tokens value is "
+                "greater than max_model_len."
+                " Please, select a smaller truncation size.")
         return None
 
     def _create_pooling_params(
@@ -528,7 +525,6 @@ class OpenAIServing:
         request: AnyRequest,
         tokenizer: AnyTokenizer,
         prompt: str,
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]],
         add_special_tokens: bool,
     ) -> TextTokensPrompt:
         async_tokenizer = self._get_async_tokenizer(tokenizer)
@@ -537,6 +533,9 @@ class OpenAIServing:
                 and self.model_config.encoder_config.get(
                     "do_lower_case", False)):
             prompt = prompt.lower()
+
+        truncate_prompt_tokens = getattr(request, "truncate_prompt_tokens",
+                                         None)
 
         if truncate_prompt_tokens is None:
             encoded = await async_tokenizer(
@@ -565,9 +564,11 @@ class OpenAIServing:
         request: AnyRequest,
         tokenizer: AnyTokenizer,
         prompt_ids: list[int],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
     ) -> TextTokensPrompt:
         async_tokenizer = self._get_async_tokenizer(tokenizer)
+
+        truncate_prompt_tokens = getattr(request, "truncate_prompt_tokens",
+                                         None)
 
         if truncate_prompt_tokens is None:
             input_ids = prompt_ids
@@ -650,7 +651,6 @@ class OpenAIServing:
         request: AnyRequest,
         tokenizer: AnyTokenizer,
         prompt_input: Union[str, list[int]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> TextTokensPrompt:
         """
@@ -662,7 +662,6 @@ class OpenAIServing:
                 request,
                 tokenizer,
             [prompt_input],
-                truncate_prompt_tokens=truncate_prompt_tokens,
                 add_special_tokens=add_special_tokens,
         ):
             return result
@@ -673,7 +672,6 @@ class OpenAIServing:
         request: AnyRequest,
         tokenizer: AnyTokenizer,
         prompt_inputs: Iterable[Union[str, list[int]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> AsyncGenerator[TextTokensPrompt, None]:
         """
@@ -687,7 +685,6 @@ class OpenAIServing:
                     request,
                     tokenizer,
                     prompt=text,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                     add_special_tokens=add_special_tokens,
                 )
             else:
@@ -695,7 +692,6 @@ class OpenAIServing:
                     request,
                     tokenizer,
                     prompt_ids=text,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                 )
 
     async def _tokenize_prompt_input_or_inputs_async(
@@ -704,7 +700,6 @@ class OpenAIServing:
         tokenizer: AnyTokenizer,
         input_or_inputs: Optional[Union[str, list[str], list[int],
                                         list[list[int]]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> tuple[list[TextTokensPrompt], list[EmbedsPrompt]]:
         """
@@ -716,6 +711,12 @@ class OpenAIServing:
         """
         inputs_embeds = list[EmbedsPrompt]()
         inputs_text = list[TextTokensPrompt]()
+
+        truncate_prompt_tokens = getattr(request, "truncate_prompt_tokens",
+                                         None)
+
+        if (truncate_prompt_tokens or 0) < 0:
+            truncate_prompt_tokens = self.max_model_len
 
         if (isinstance(request, CompletionRequest)
                 and request.prompt_embeds is not None):
@@ -744,14 +745,10 @@ class OpenAIServing:
                     request,
                     tokenizer,
                     prompt_input["content"],
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                     add_special_tokens=add_special_tokens)
             else:
                 task = self._normalize_prompt_tokens_to_input(
-                    request,
-                    tokenizer,
-                    prompt_input["content"],
-                    truncate_prompt_tokens=truncate_prompt_tokens)
+                    request, tokenizer, prompt_input["content"])
             tasks.append(task)
 
         # Wait for all tokenization tasks to complete
@@ -768,7 +765,6 @@ class OpenAIServing:
                        TokenizeCompletionRequest],
         tokenizer: AnyTokenizer,
         input_or_inputs: Union[str, list[str], list[int], list[list[int]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = ...,
         add_special_tokens: bool = ...,
     ) -> tuple[list[TextTokensPrompt], list[EngineTokensPrompt]]:
         ...
@@ -780,7 +776,6 @@ class OpenAIServing:
         tokenizer: AnyTokenizer,
         input_or_inputs: Optional[Union[str, list[str], list[int],
                                         list[list[int]]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = ...,
         add_special_tokens: bool = ...,
     ) -> tuple[list[Union[TextTokensPrompt, EmbedsPrompt]], list[Union[
             EngineTokensPrompt, EngineEmbedsPrompt]]]:
@@ -792,7 +787,6 @@ class OpenAIServing:
         tokenizer: AnyTokenizer,
         input_or_inputs: Optional[Union[str, list[str], list[int],
                                         list[list[int]]]],
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None,
         add_special_tokens: bool = True,
     ) -> tuple[Union[list[TextTokensPrompt], list[Union[
             TextTokensPrompt, EmbedsPrompt]]], Union[
@@ -809,7 +803,6 @@ class OpenAIServing:
              request,
              tokenizer,
              input_or_inputs,
-             truncate_prompt_tokens=truncate_prompt_tokens,
              add_special_tokens=add_special_tokens,
          )
 
@@ -862,7 +855,6 @@ class OpenAIServing:
         documents: Optional[list[dict[str, str]]] = None,
         chat_template_kwargs: Optional[dict[str, Any]] = None,
         tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None,
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         add_special_tokens: bool = False,
     ) -> tuple[list[ConversationMessage], Sequence[RequestPrompt],
                list[EngineTokensPrompt]]:
@@ -937,7 +929,6 @@ class OpenAIServing:
                 request,
                 tokenizer,
                 request_prompt,
-                truncate_prompt_tokens=truncate_prompt_tokens,
                 add_special_tokens=add_special_tokens,
             )
         else:
