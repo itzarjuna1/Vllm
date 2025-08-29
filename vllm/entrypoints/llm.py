@@ -44,6 +44,7 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import (ClassificationRequestOutput, EmbeddingRequestOutput,
                           PoolingRequestOutput, RequestOutput,
                           ScoringRequestOutput)
+from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import (BeamSearchParams, RequestOutputKind,
                                   SamplingParams)
@@ -283,6 +284,11 @@ class LLM:
         logger.info("Supported_tasks: %s", supported_tasks)
 
         self.supported_tasks = supported_tasks
+
+        # Load the Input/Output processor plugin if any
+        io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
+        self.io_processor = get_io_processor(self.llm_engine.vllm_config,
+                                             io_processor_plugin)
 
     def get_tokenizer(
         self,
@@ -939,6 +945,75 @@ class LLM:
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return self.engine_class.validate_outputs(outputs,
                                                   PoolingRequestOutput)
+
+    def encode_with_io_processor(
+        self,
+        prompt: Any,
+        /,
+        pooling_params: Optional[Union[PoolingParams,
+                                       Sequence[PoolingParams]]] = None,
+        *,
+        truncate_prompt_tokens: Optional[int] = None,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        pooling_task: PoolingTask = "encode",
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
+    ) -> Any:
+
+        if self.io_processor is None:
+            raise ValueError("No IOProcessor plugin installed. Please refer "
+                             "to the documentation and to the "
+                             "'prithvi_geospatial_mae_io_processor' "
+                             "offline inference example for more details.")
+
+        # Validate the request data is valid for the loaded plugin
+        validated_prompt = self.io_processor.parse_request(prompt)
+
+        model_config = self.llm_engine.model_config
+        runner_type = model_config.runner_type
+        if runner_type != "pooling":
+            raise ValueError(
+                "LLM.encode_with_mm_data_plugin() is only supported for " \
+                "pooling models. Try passing `--runner pooling` to " \
+                "use the model as a pooling model.")
+
+        # obtain the actual model prompts from the pre-processor
+        processed_prompts = (self.io_processor.pre_process(
+            prompt=validated_prompt))
+
+        if pooling_params is None:
+            # Use default pooling params.
+            pooling_params = PoolingParams()
+
+        if isinstance(pooling_params, PoolingParams):
+            pooling_params.verify(pooling_task, model_config)
+        else:
+            for pooling_param in pooling_params:
+                pooling_param.verify(pooling_task, model_config)
+
+        if tokenization_kwargs is None:
+            tokenization_kwargs = dict[str, Any]()
+            _validate_truncation_size(model_config.max_model_len,
+                                      truncate_prompt_tokens,
+                                      tokenization_kwargs)
+
+        self._validate_and_add_requests(
+            prompts=processed_prompts,
+            params=pooling_params,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+
+        outputs = self._run_engine(use_tqdm=use_tqdm)
+        model_outputs = self.engine_class.validate_outputs(
+            outputs, PoolingRequestOutput)
+
+        # get the post-processed model outputs
+        processed_outputs = self.io_processor.post_process(
+            model_output=model_outputs)
+
+        return processed_outputs
 
     def embed(
         self,
