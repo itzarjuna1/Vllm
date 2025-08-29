@@ -169,21 +169,20 @@ class SingleTypeKVCacheManager(ABC):
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
+                                     running_request_ids: set[str]) -> int:
         """
         Get the number of common prefix blocks for all requests in the RUNNING
         state.
 
         Args:
             request_id: The request ID.
-            num_running_requests: The total number of requests in the RUNNING
+            running_request_ids: The set of request IDs currently in RUNNING
                 state.
 
         Returns:
             The number of common prefix blocks for all requests in the RUNNING
                 state.
         """
-
         raise NotImplementedError
 
     @classmethod
@@ -282,14 +281,51 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         pass
 
     def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
-        blocks = self.req_to_blocks[request_id]
+                                     running_request_ids: set[str]) -> int:
+        """Get number of common prefix blocks shared by all active requests.
+        
+        Args:
+            request_id: Reference request ID.
+            running_request_ids: Set of running request IDs.
+            
+        Returns:
+            Number of common prefix blocks.
+        """
+        if not running_request_ids or request_id not in self.req_to_blocks:
+            return 0
+
+        all_active_request_ids = running_request_ids
+
+        request_blocks = {}
+        min_blocks = float('inf')
+
+        for req_id in all_active_request_ids:
+            if req_id in self.req_to_blocks:
+                blocks = self.req_to_blocks[req_id]
+                request_blocks[req_id] = blocks
+                min_blocks = min(min_blocks, len(blocks))
+
+        if not request_blocks or min_blocks == float('inf'):
+            return 0
+
+        reference_req_id = next(iter(request_blocks.keys()))
         num_common_blocks = 0
-        for block in blocks:
-            if block.ref_cnt == num_running_requests:
+        min_blocks_int = int(min_blocks)
+
+        for pos in range(min_blocks_int):
+            reference_block = request_blocks[reference_req_id][pos]
+
+            all_match = True
+            for req_id, blocks in request_blocks.items():
+                if blocks[pos] != reference_block:
+                    all_match = False
+                    break
+
+            if all_match:
                 num_common_blocks += 1
             else:
                 break
+
         return num_common_blocks
 
 
@@ -380,8 +416,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
+    def get_num_common_prefix_blocks(
+        self,
+        request_id: str,
+        running_request_ids: set[str],
+    ) -> int:
         """
         NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
         So it's not correct to count ref_cnt like FullAttentionManager. Return 
@@ -506,8 +545,11 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
+    def get_num_common_prefix_blocks(
+        self,
+        request_id: str,
+        running_request_ids: set[str],
+    ) -> int:
         """
         cascade attention is not supported by chunked local attention.
         """
@@ -541,8 +583,11 @@ class MambaManager(SingleTypeKVCacheManager):
         # remove blocks.
         pass
 
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
+    def get_num_common_prefix_blocks(
+        self,
+        request_id: str,
+        running_request_ids: set[str],
+    ) -> int:
         return 0
 
     def allocate_new_blocks(self, request_id: str,
@@ -569,7 +614,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         raise ValueError("Should not be called as prefix caching is disabled.")
 
     def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> int:
+                                     running_request_ids: set[str]) -> int:
         # Cross-attention blocks contain request-specific encoder states
         # and are not shared between different requests
         return 0
