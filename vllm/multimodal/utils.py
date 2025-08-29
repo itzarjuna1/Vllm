@@ -444,7 +444,7 @@ def run_dp_sharded_vision_model(image_input: torch.Tensor,
     Args:
         image_input (torch.Tensor): Image input tensor.
         vision_model (torch.nn.Module): Vision model.
-
+        
     Returns:
         torch.Tensor: Output image embeddings
     """
@@ -467,6 +467,174 @@ def run_dp_sharded_vision_model(image_input: torch.Tensor,
                                                          dim=0)
     vision_embeddings = vision_embeddings[:num_chunks, ...]
     return vision_embeddings
+
+
+def run_dp_sharded_mrope_vision_model_tensor_Kimi(
+    vision_model: torch.nn.Module,
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Run a vision model with data parallelism (DP) sharding for tensor 
+    grid_thw. Optimized version specifically for torch.Tensor grid_thw input.
+    
+    Args:
+        vision_model (torch.nn.Module): Vision model.
+        pixel_values (torch.Tensor): Image/Video input tensor.
+        grid_thw (torch.Tensor): Grid dimensions tensor of shape [num_items, 2]
+        
+    Returns:
+        tuple[torch.Tensor, ...]: Output image embeddings per item
+        
+    Example:
+        ```
+        vision_model.out_hidden_size = 64
+        vision_model.merge_kernel_size = 2
+        pixel_values.shape = (1350, channel)
+        grid_thw.shape = (4, 2)  # [[10, 100], [10, 10], 
+        [10, 20], [5, 10]]
+        tp_size=2
+        ```
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank_local = get_tensor_model_parallel_rank()
+
+    # Calculate patches per item directly on tensor
+    patches_per_item_tensor = grid_thw.prod(dim=1)  # [num_items]
+    total_patches = patches_per_item_tensor.sum().item()
+
+    if pixel_values.shape[0] != total_patches:
+        raise ValueError(
+            f"Pixel values shape {pixel_values.shape[0]} doesn't match "
+            f"expected total patches {total_patches}")
+
+    # Convert to list only for load balancing algorithm
+    patches_per_item = patches_per_item_tensor.tolist()
+
+    # Calculate cumulative patches using tensor operations
+    cum_patches_tensor = torch.cat([
+        torch.zeros(1,
+                    device=patches_per_item_tensor.device,
+                    dtype=patches_per_item_tensor.dtype),
+        patches_per_item_tensor.cumsum(dim=0)
+    ])
+
+    # Get load balancing assignment
+    (image_to_tp_rank, gpu_sample_counts,
+     grouped_pixel_values_len) = get_load_balance_assignment(
+         patches_per_item, tp_size)
+
+    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+
+    # Get items assigned to this rank
+    item_idxs_local = image_to_tp_rank[cum_gpu_sample_counts[tp_rank_local]:
+                                       cum_gpu_sample_counts[tp_rank_local +
+                                                             1]]
+
+    # Get the pixel values for the local items
+    if len(item_idxs_local) > 0:
+        # Extract pixel values for local items using tensor operations
+        pixel_slices = []
+        for i in item_idxs_local:
+            start_idx = cum_patches_tensor[i].item()
+            end_idx = cum_patches_tensor[i + 1].item()
+            pixel_slices.append(pixel_values[start_idx:end_idx])
+
+        pixel_values_local = torch.cat(pixel_slices, dim=0)
+
+        # Extract grid_thw for local items using tensor indexing
+        item_idxs_tensor = torch.tensor(item_idxs_local,
+                                        device=grid_thw.device,
+                                        dtype=torch.long)
+        grid_thw_local = grid_thw[item_idxs_tensor]
+    else:
+        # Handle case where this rank has no items
+        pixel_values_local = torch.empty((0, pixel_values.shape[1]),
+                                         device=pixel_values.device,
+                                         dtype=pixel_values.dtype)
+        grid_thw_local = torch.empty((0, grid_thw.shape[1]),
+                                     device=grid_thw.device,
+                                     dtype=grid_thw.dtype)
+
+    # Calculate output dimensions
+    embed_dim_reduction_factor = (vision_model.merge_kernel_size[0] *
+                                  vision_model.merge_kernel_size[1])
+    # Find max length for padding
+    max_len_per_rank = (max(grouped_pixel_values_len) //
+                        embed_dim_reduction_factor)
+
+    # Run the vision model on local data
+    if pixel_values_local.shape[0] > 0:
+        image_embeds_local = vision_model(pixel_values_local, grid_thw_local)
+        # Compatible for list/tensor
+        if isinstance(image_embeds_local, list):
+            image_embeds_local = torch.cat(image_embeds_local, dim=0)
+    else:
+        out_dim = None
+        # 1. use projector output size first
+        if hasattr(vision_model, "multi_modal_projector"):
+            out_dim = getattr(vision_model.multi_modal_projector.linear_2,
+                              "out_features", None)
+        # 2. MoonVit: config.hidden_size
+        elif hasattr(vision_model, "config"):
+            out_dim = getattr(vision_model.config, "hidden_size", None)
+        # 3. QwenVL: out_hidden_size
+        out_dim = out_dim or getattr(vision_model, "out_hidden_size", None)
+        image_embeds_local = torch.empty(
+            (0, embed_dim_reduction_factor, out_dim),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype)
+
+    # Pad the output for all_gather
+    current_len = image_embeds_local.shape[0]
+    if current_len < max_len_per_rank:
+        padding_size = max_len_per_rank - current_len
+        padding = torch.empty((padding_size, image_embeds_local.shape[1],
+                               image_embeds_local.shape[2]),
+                              dtype=image_embeds_local.dtype,
+                              device=image_embeds_local.device)
+        image_embeds_local_padded = torch.cat([image_embeds_local, padding],
+                                              dim=0)
+    else:
+        image_embeds_local_padded = image_embeds_local
+
+    # Gather embeddings from all ranks
+    gathered_embeds = tensor_model_parallel_all_gather(
+        image_embeds_local_padded, dim=0)
+    # Remove padding and reconstruct per-rank embeddings
+    rank_embeddings = []
+    for rank in range(tp_size):
+        start_idx = rank * max_len_per_rank
+        end_idx = start_idx + (grouped_pixel_values_len[rank] //
+                               embed_dim_reduction_factor)
+        rank_embeddings.append(gathered_embeds[start_idx:end_idx])
+
+    # Calculate patches per output item after spatial merging
+    patches_per_output_item = [(patch_size // embed_dim_reduction_factor)
+                               for patch_size in patches_per_item]
+
+    # Reconstruct embeddings in original order
+    original_order_embeddings = [None] * len(patches_per_item)
+    current_idx = 0
+    for rank in range(tp_size):
+        count = gpu_sample_counts[rank]
+        if count > 0:
+            rank_items = image_to_tp_rank[current_idx:current_idx + count]
+            rank_embed = rank_embeddings[rank]
+
+            embed_start = 0
+            for item_idx in rank_items:
+                item_patches = patches_per_output_item[item_idx]
+                original_order_embeddings[item_idx] = rank_embed[
+                    embed_start:embed_start + item_patches]
+                embed_start += item_patches
+            current_idx += count
+
+    out_embeddings = [
+        embed for embed in original_order_embeddings if embed is not None
+    ]
+    assert (len(out_embeddings) == len(original_order_embeddings)), \
+        "Found unassigned embeddings"
+    return out_embeddings
 
 
 def get_load_balance_assignment(
