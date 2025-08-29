@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -222,6 +224,45 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
     def supports_expert_map(self) -> bool:
         return False
 
+    def _get_effective_num_dispatchers(self) -> int:
+        """
+        Calculates the effective number of token dispatchers considering tensor
+        parallelism.
+        
+        When tensor parallelism (TP) is used (TP > 1), only the leader rank
+        (rank 0) in each TP group should dispatch tokens to avoid redundant
+        communication. This significantly reduces cross-rank communication
+        overhead in distributed environments.
+        
+        Returns:
+            int: The effective number of dispatchers to use.
+            When TP > 1:
+            - Returns max(1, num_dispatchers // tp_size) for leader ranks
+              (tp_rank == 0)
+            - Returns 0 for non-leader ranks (tp_rank != 0)
+            When TP <= 1:
+            - Returns the original num_dispatchers
+            
+        Note:
+            Leader ranks are guaranteed at least 1 dispatcher for stability,
+            while non-leader ranks return 0 to eliminate redundant dispatching.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        if tp_size <= 1:
+            # No TP or single device - use all dispatchers
+            return self.num_dispatchers
+
+        # TP > 1 case
+        if tp_rank == 0:
+            # Leader rank gets a proportional share of dispatchers
+            dispatchers_per_group = max(1, self.num_dispatchers // tp_size)
+            return dispatchers_per_group
+
+        # Non-leader ranks don't dispatch
+        return 0
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # Let PrepareAndFinalize::finalize() decide the impl.
         return TopKWeightAndReduceDelegate()
@@ -239,10 +280,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_metadata: Optional[mk.ExpertTokensMetadata],
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
-        # FIXME (varun): We should be able to dispatch only from the leader
-        # DP ranks in the case of TP > 1. At the moment, all the Ranks
-        # end up sending their tokens. This needs to be fixed.
-        num_dispatchers = self.num_dispatchers
+        # Optimize token dispatch: only leader DP ranks dispatch tokens when
+        # TP > 1. This reduces cross-rank communication overhead in distributed
+        # MoE models.
+        num_dispatchers = self._get_effective_num_dispatchers()
         num_experts = local_num_experts
         max_num_tokens = a.size(
             0) if self.max_num_tokens is None else self.max_num_tokens
@@ -276,6 +317,14 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
     ):
         assert expert_tokens_meta is not None
         expert_num_tokens = expert_tokens_meta.expert_num_tokens
+
+        # Monitor expert_num_tokens for workspace allocation analysis
+        logger.info(
+            "[MoE Monitor] expert_num_tokens shape: %s, sum: %s, max: %s, "
+            "values: %s", expert_num_tokens.shape,
+            expert_num_tokens.sum().item(),
+            expert_num_tokens.max().item(),
+            expert_num_tokens.cpu().numpy())
 
         assert hidden_states.ndim == 3
         assert self.block_shape is not None
