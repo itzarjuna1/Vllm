@@ -136,15 +136,15 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> list[int]:
+    def get_num_common_prefix_blocks(
+            self, request_id: str, running_request_ids: set[str]) -> list[int]:
         """
         Get the number of common prefix blocks for all requests in the RUNNING
         state for each kv cache group.
 
         Args:
             request_id: The request ID.
-            num_running_requests: The total number of requests in the RUNNING
+            running_request_ids: The set of request IDs currently in RUNNING
                 state.
 
         Returns:
@@ -153,7 +153,7 @@ class KVCacheCoordinator(ABC):
         """
         num_blocks_per_group = [
             manager.get_num_common_prefix_blocks(request_id,
-                                                 num_running_requests)
+                                                 running_request_ids)
             for manager in self.single_type_managers
         ]
         return num_blocks_per_group
@@ -202,8 +202,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
                          enable_kv_cache_events)
         self.num_single_type_manager = len(self.single_type_managers)
 
-    def get_num_common_prefix_blocks(self, request_id: str,
-                                     num_running_requests: int) -> list[int]:
+    def get_num_common_prefix_blocks(
+            self, request_id: str, running_request_ids: set[str]) -> list[int]:
         return [0] * self.num_single_type_manager
 
     def find_longest_cache_hit(
